@@ -252,7 +252,7 @@ void drawTideChart(const struct tm& timeinfo) {
     String timeStr = p["t"].as<String>();
     int totalMinutes = timeStr.substring(11, 13).toInt() * 60 + timeStr.substring(14, 16).toInt();
     int x = map(totalMinutes, 0, 1440, graphX, graphX + graphW);
-    int y = map(p["v"].as<float>(), minTide, maxTide, graphY + graphH, graphY);
+    int y = graphY + graphH - (int)round(((p["v"].as<float>() - minTide) / (maxTide - minTide)) * graphH);
 
     if (lastX != -1) tft.drawLine(lastX, lastY, x, y, TFT_SKYBLUE);
     lastX = x;
