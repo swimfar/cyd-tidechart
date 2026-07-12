@@ -26,19 +26,25 @@
   Serial.println("Warning: SPI freq. is greater than 27 MHz.  This can cause screen issues");
 #endif
 
+// ================================================================
+// User Settings
+// ================================================================
 // Replace with your WiFi network credentials
 const char* ssid = "ssid";
 const char* password = "password";
 
 // You can find station IDs at: https://tidesandcurrents.noaa.gov/stations.html
 const char* stationId = "9415144";  // Chicago
+const float lowLimit = -1.0;  // Low tide limit (show red below this value)
 
 const char* ntpServer = "pool.ntp.org"; // NTP server for time synchronization
 //const char* time_zone = "EST5EDT,M3.2.0,M11.1.0";  // New York (Eastern Time)
-//const char* time_zone = "CST6CDT,M3.2.0,M11.1.0";  // Chicago (Central Time)
+const char* time_zone = "CST6CDT,M3.2.0,M11.1.0";  // Chicago (Central Time)
 //const char* time_zone = "MST7MDT,M3.2.0,M11.1.0";  // Denver (Mountain Time)
-const char* time_zone = "PST8PDT,M3.2.0,M11.1.0";  // Los Angeles (Pacific Time)
-const bool display24hour = false;  // set to true to display time in 24-hour format
+//const char* time_zone = "PST8PDT,M3.2.0,M11.1.0";  // Los Angeles (Pacific Time)
+const bool display24hour = true;  // set to true to display time in 24-hour format
+// ================================================================
+// ================================================================
 
 TFT_eSPI tft = TFT_eSPI();  // Create a TFT_eSPI instance (Display)
 
@@ -57,6 +63,9 @@ XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);  // Touchscreen
 #define STARTUP_FONT_SIZE 4  // 26 px font
 #define STARTUP_FONT_PXL 26
 
+unsigned long lastUpdateTime = 0;
+const unsigned long UPDATE_INTERVAL = 15UL * 60UL * 1000UL; // 15 minutes (in ms)
+
 float stationLat = 360;  // NOAA station latitude and longitude (initialize to invalid value)
 float stationLon = 360;
 const char* stationName;  // NOAA station name based on station ID
@@ -69,13 +78,14 @@ String lowTideEvents[2];
 int dataDayOfYear = -1;
 int dawnMinutes = 0;
 int duskMinutes = 0;
+int dayOffset = 0;  // Used to get data for tomorrow or yesterday
 
 void connectToWiFi();
 void initTime();
 void fetchAndDisplayTides();
-bool getTidePredictions();
+bool getTidePredictions(const struct tm &timeinfo);
 void processTidePredictions();
-void drawTideChart(const struct tm& timeinfo);
+void drawTideChart(const struct tm &timeinfo);
 bool getLocalDawnDusk(double lat, double lon);
 bool getStationLatLon();
 
@@ -134,8 +144,43 @@ void setup() {
 
 
 void loop() {
-  delay(15 * 60 * 1000);  // every 15 min
-  fetchAndDisplayTides();
+  unsigned long currentMillis = millis();
+
+  // 15-minute update interval for display
+  if (currentMillis - lastUpdateTime >= UPDATE_INTERVAL) {
+    fetchAndDisplayTides();
+    lastUpdateTime = currentMillis;
+  }
+
+  // Check for touch-screen touch
+  uint16_t t_x = 0, t_y = 0;
+  if (touchscreen.tirqTouched() && touchscreen.touched()){
+    Serial.println("Screen touched.");
+    TS_Point p = touchscreen.getPoint();
+    int touch_x = map(p.x, 200, 3700, 1, SCREEN_WIDTH);
+    int touch_y = map(p.y, 240, 3800, 1, SCREEN_HEIGHT);
+    Serial.print("X: ");
+    Serial.print(touch_x);
+    Serial.print("  Y: ");
+    Serial.println(touch_y);
+    if (touch_y < 45) {
+      Serial.println("Top of screen touched.");
+      if (touch_x < 60) {
+        Serial.println("Subtract a day");
+        dayOffset -= 1;
+      } else if (touch_x > 260) {
+        Serial.println("Add a day");
+        dayOffset += 1;
+      } else {
+        dayOffset = 0;  // Reset the offset
+      }
+    }
+ 
+    fetchAndDisplayTides();  // update tides
+    lastUpdateTime = currentMillis;
+
+    delay(500);  // debounce delay to avoid a double-trigger
+  }
 }
 
 
@@ -197,15 +242,22 @@ void fetchAndDisplayTides() {
     return;  // This should fail more gracefully instead of blanking the screen. Don't need time to display chart
   }
 
-  if (timeinfo.tm_yday != dataDayOfYear) {
+  // Calculate offset time (for looking at different days predictions)
+  time_t epoch_time = mktime(&timeinfo);  // convert to epoch time to avoid year rollovers
+  epoch_time += dayOffset * 86400;
+  struct tm offsetTimeInfo;
+  localtime_r(&epoch_time, &offsetTimeInfo);  // convert back to tm struct
+
+//  if (timeinfo.tm_yday != dataDayOfYear) {
+  if (offsetTimeInfo.tm_yday != dataDayOfYear) {
     Serial.println("New day detected. Fetching fresh tide data...");
     tft.fillScreen(TFT_BLACK); // Clear screen to show status
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.drawCentreString("Fetching new tide data...", tft.width()/2, tft.height()/2, STARTUP_FONT_SIZE);
 
-    if (getTidePredictions()) {
+    if (getTidePredictions(offsetTimeInfo)) {
       processTidePredictions();
-      dataDayOfYear = timeinfo.tm_yday;
+      dataDayOfYear = offsetTimeInfo.tm_yday;
       Serial.println("Successfully fetched and processed new data.");
     } else {
       Serial.println("Failed to fetch new tide data. Will retry later.");
@@ -215,7 +267,8 @@ void fetchAndDisplayTides() {
     Serial.println("Data for today already cached. Redrawing chart.");
   }
 
-  drawTideChart(timeinfo);
+//  drawTideChart(timeinfo);
+  drawTideChart(offsetTimeInfo);
 }
 
 
@@ -223,9 +276,9 @@ void fetchAndDisplayTides() {
  * Fetches and parses tide prediction data from the NOAA API.
  * @return True on success, false on failure.
  */
-bool getTidePredictions() {
-  struct tm timeinfo;
-  getLocalTime(&timeinfo);
+bool getTidePredictions(const struct tm &timeinfo) {
+//  struct tm timeinfo;
+//  getLocalTime(&timeinfo);
   char dateBuffer[9];
   strftime(dateBuffer, sizeof(dateBuffer), "%Y%m%d", &timeinfo);
 
@@ -305,12 +358,17 @@ void processTidePredictions() {
     int currentTrend = (currentHeight > prevHeight) ? 1 : ((currentHeight < prevHeight) ? -1 : lastTrend);
 
     if (currentTrend != lastTrend && lastTrend != 0) {
+      String displayTime;
       JsonObject peak = predictions[i - 1];  // get time and tide height for this moment
       int hour24 = peak["t"].as<String>().substring(11, 13).toInt();  // extract hour
       String minutes = peak["t"].as<String>().substring(14, 16);  // extract minute
-      String suffix = (hour24 < 12) ? "am" : "pm";
-      int hour12 = (hour24 % 12 == 0) ? 12 : hour24 % 12;
-      String displayTime = String(hour12) + ":" + minutes + suffix;
+      if (display24hour == false){
+        String suffix = (hour24 < 12) ? "am" : "pm";
+        int hour12 = (hour24 % 12 == 0) ? 12 : hour24 % 12;
+        displayTime = String(hour12) + ":" + minutes + suffix;
+      } else {
+        displayTime = String(hour24) + ":" + minutes;
+      }
       // Todo: add option for 24 hour format
       String eventStr = displayTime + " (" + String(peak["v"].as<float>(), 1) + "ft)";
 
@@ -327,9 +385,9 @@ void processTidePredictions() {
 
 /**
  * Renders the complete tide chart UI on the TFT display.
- * @param timeinfo A struct containing the current time for the display.
+ * @param timeinfo A struct containing the date to display at the top.
  */
-void drawTideChart(const struct tm& timeinfo) {
+void drawTideChart(const struct tm &timeinfo) {
   const uint16_t color_bgd = TFT_BLACK;
   const int font_size_date = 4;
   tft.fillScreen(color_bgd);
@@ -356,18 +414,20 @@ void drawTideChart(const struct tm& timeinfo) {
   // ================================================================
   // Draw the Tide Graph
   // ================================================================
+//  const int graph_w = 20;
+//  const int graph_h = 125;
   const int graphX = 10, graphY = 115;  // top left coordinates of graph
   const int graphW = tft.width() - 20, graphH = tft.height() - 125;
 
   tft.fillRect(graphX, graphY, graphW, graphH, TFT_SKYBLUE);  // background daytime color
-  int noon_coord_x = graphX + graphW / 2;
-  int six_coord_x = graphX + graphW / 4;
-  int eighteen_coord_x = graphX + 3 * graphW / 4;
-  tft.drawFastVLine(noon_coord_x, graphY, graphH, TFT_DARKGREY);  // line at noon
-  tft.drawFastVLine(six_coord_x, graphY, 4, TFT_DARKGREY);  // upper tick at 6am
-  tft.drawFastVLine(six_coord_x, graphY + graphH - 4, 4, TFT_DARKGREY);  // lower tick at 6am
-  tft.drawFastVLine(eighteen_coord_x, graphY, 4, TFT_DARKGREY);  // upper tick at 6pm
-  tft.drawFastVLine(eighteen_coord_x, graphY + graphH - 4, 4, TFT_DARKGREY);  // lower tick at 6pm
+//  int noon_coord_x = graphX + graphW / 2;
+//  int six_coord_x = graphX + graphW / 4;
+//  int eighteen_coord_x = graphX + 3 * graphW / 4;
+//  tft.drawFastVLine(noon_coord_x, graphY, graphH, TFT_DARKGREY);  // line at noon
+//  tft.drawFastVLine(six_coord_x, graphY, 4, TFT_DARKGREY);  // upper tick at 6am
+//  tft.drawFastVLine(six_coord_x, graphY + graphH - 4, 4, TFT_DARKGREY);  // lower tick at 6am
+//  tft.drawFastVLine(eighteen_coord_x, graphY, 4, TFT_DARKGREY);  // upper tick at 6pm
+//  tft.drawFastVLine(eighteen_coord_x, graphY + graphH - 4, 4, TFT_DARKGREY);  // lower tick at 6pm
 
   if (dawnMinutes > 0) {
     int dawnW = int((dawnMinutes / 1440.0) * graphW);  // pixel width of midnight to dawn
@@ -384,26 +444,60 @@ void drawTideChart(const struct tm& timeinfo) {
     Serial.println(duskMinutes);
     Serial.println(duskW);
   }
-  tft.drawRect(graphX - 1, graphY - 1, graphW + 2, graphH + 2, TFT_LIGHTGREY);
+//  tft.drawRect(graphX - 1, graphY - 1, graphW + 2, graphH + 2, TFT_LIGHTGREY);  // Border
 
+  int graphBotCoord = graphY + graphH;
   int lastX = -1, lastY = -1;
   for (JsonObject p : predictions) {
     String timeStr = p["t"].as<String>();
     int totalMinutes = timeStr.substring(11, 13).toInt() * 60 + timeStr.substring(14, 16).toInt();
     int x = map(totalMinutes, 0, 1440, graphX, graphX + graphW);
-    int y = graphY + graphH - (int)round(((p["v"].as<float>() - minTide) / (maxTide - minTide)) * graphH);
+    int y = graphBotCoord - (int)round(((p["v"].as<float>() - minTide) / (maxTide - minTide)) * graphH);
 
     if (lastX != -1) {
+      int dx = x - lastX;
+      if (p["v"].as<float>() < lowLimit){
+        float limitH = (int)round(((lowLimit - minTide) / (maxTide - minTide)) * graphH);
+        float limitY = graphBotCoord - limitH;  // top coordinate of limit
+        tft.fillRect(lastX, limitY, dx, limitH, TFT_RED);
+      }
+      // Fill below the line with a different color
+      if (y > lastY){  // Rising tide (upward line slope)
+        tft.fillTriangle(lastX, lastY, x, y, x, lastY, TFT_BLUE);
+        int fillHeight = graphBotCoord - lastY;
+        tft.fillRect(lastX, lastY, dx, fillHeight, TFT_BLUE);
+      } else if (y < lastY) {  // Dropping tide (downward line slope)
+        tft.fillTriangle(lastX, lastY, x, y, lastX, y, TFT_BLUE);
+        int fillHeight = graphBotCoord - y;
+        tft.fillRect(lastX, y, dx, fillHeight, TFT_BLUE);        
+      } else {
+        int fillHeight = graphBotCoord - y;
+        tft.fillRect(lastX, lastY, dx, fillHeight, TFT_BLUE);
+      }
       tft.drawLine(lastX, lastY, x, y, TFT_BLACK);
-      tft.drawLine(lastX, lastY+1, x, y+1, TFT_BLACK);
+      tft.drawLine(lastX, lastY+1, x, y+1, TFT_BLACK);  // make the line thicker
     }
     lastX = x;
     lastY = y;
   }
 
-  int currentMinute = timeinfo.tm_hour * 60 + timeinfo.tm_min;
-  int timeX = map(currentMinute, 0, 1440, graphX, graphX + graphW);
-  tft.drawFastVLine(timeX, graphY, graphH, TFT_RED);
+  // Draw hour markers
+  int noon_coord_x = graphX + graphW / 2;
+  int six_coord_x = graphX + graphW / 4;
+  int eighteen_coord_x = graphX + 3 * graphW / 4;
+  tft.drawFastVLine(noon_coord_x, graphY, graphH, TFT_DARKGREY);  // line at noon
+  tft.drawFastVLine(six_coord_x, graphY, 4, TFT_DARKGREY);  // upper tick at 6am
+  tft.drawFastVLine(six_coord_x, graphY + graphH - 4, 4, TFT_DARKGREY);  // lower tick at 6am
+  tft.drawFastVLine(eighteen_coord_x, graphY, 4, TFT_DARKGREY);  // upper tick at 6pm
+  tft.drawFastVLine(eighteen_coord_x, graphY + graphH - 4, 4, TFT_DARKGREY);  // lower tick at 6pm
+  tft.drawRect(graphX - 1, graphY - 1, graphW + 2, graphH + 2, TFT_LIGHTGREY);  // Border
+
+  // Draw red line at current time
+  if (dayOffset == 0) {
+    int currentMinute = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+    int timeX = map(currentMinute, 0, 1440, graphX, graphX + graphW);
+    tft.drawFastVLine(timeX, graphY, graphH, TFT_RED);
+  }
 }
 
 
@@ -473,6 +567,7 @@ bool getStationLatLon() {
                "&end_date=" + String(dateBuffer) +
                "&datum=MLLW&units=english&time_zone=lst&format=json";
 
+  Serial.println(url);
   HTTPClient http;
   WiFiClientSecure client;
   client.setInsecure();
@@ -481,6 +576,7 @@ bool getStationLatLon() {
   int httpCode = http.GET();
 
   if (httpCode != HTTP_CODE_OK) {
+    Serial.println("httpCode not OK");
     stationLat = 360;  // set to an invalid number
     stationLon = 360;
     return false;
@@ -490,6 +586,7 @@ bool getStationLatLon() {
   http.end();
 
   if (error) {
+    Serial.println("JSON Error");
     tft.fillScreen(TFT_RED);
     tft.drawString("JSON Error!", 10, 10, STARTUP_FONT_SIZE);
     tft.drawString(error.c_str(), 10, 30, STARTUP_FONT_SIZE);
